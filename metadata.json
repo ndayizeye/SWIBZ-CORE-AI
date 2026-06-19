@@ -1,0 +1,8 @@
+{
+  "name": "Swibz AI Core",
+  "description": "A high-performance multi-tenant AI core platform allowing businesses to deploy specialized workflows and assistants across multiple channels like WhatsApp, Telegram, SMS, and Email.",
+  "requestFramePermissions": [],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}

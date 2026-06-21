@@ -6,7 +6,12 @@ export const tenants = pgTable('tenants', {
   industryType: text('industry_type').notNull(),
   subscriptionPlan: text('subscription_plan').notNull(),
   subscriptionStatus: text('subscription_status').notNull(),
-  createdAt: text('created_at').notNull()
+  createdAt: text('created_at').notNull(),
+  logoUrl: text('logo_url'),
+  customAiInstructions: text('custom_ai_instructions'),
+  physicalAddress: text('physical_address'),
+  phoneNumber: text('phone_number'),
+  emailAddress: text('email_address')
 });
 
 export const users = pgTable('users', {

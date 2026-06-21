@@ -6,7 +6,36 @@
 import * as fs from 'fs';
 import * as path from 'path';
 import { eq } from 'drizzle-orm';
-import { db as pgDb } from '../db/index.ts';
+import { db as rawPgDb } from '../db/index.ts';
+
+let pgDbConnectionActive = false;
+
+// Chainable dummy builder for safe local offline-simulation when Cloud SQL is offline or not configured
+const dummyBuilder = (...args: any[]) => {
+  const dummy: any = (...innerArgs: any[]) => dummy;
+  const props = ['values', 'set', 'where', 'returning', 'catch', 'then'];
+  props.forEach(p => {
+    dummy[p] = (...propArgs: any[]) => dummy;
+  });
+  dummy.then = (onfulfilled: any, onrejected: any) => Promise.resolve([]).then(onfulfilled, onrejected);
+  dummy.catch = (onrejected: any) => Promise.resolve([]).catch(onrejected);
+  return dummy;
+};
+
+// Proxy that forwards queries to Cloud SQL if connected/configured, otherwise intercepts writes safely
+const pgDb = new Proxy(rawPgDb, {
+  get(target, prop, receiver) {
+    if (prop === 'select') {
+      return Reflect.get(target, prop, receiver);
+    }
+    if (prop === 'insert' || prop === 'update' || prop === 'delete') {
+      if (!pgDbConnectionActive) {
+        return dummyBuilder;
+      }
+    }
+    return Reflect.get(target, prop, receiver);
+  }
+});
 import * as schema from '../db/schema.ts';
 import {
   Tenant,
@@ -24,6 +53,7 @@ import {
   IndustryType,
   SubscriptionPlan
 } from '../types.js';
+import { IndustryTemplate, defaultIndustryTemplates } from './industryTemplates.ts';
 
 const DB_FILE_PATH = path.join(process.cwd(), 'db-sim.json');
 
@@ -39,6 +69,7 @@ interface SchemaSim {
   orders: Order[];
   riders: Rider[];
   payments: Payment[];
+  industryTemplates: IndustryTemplate[];
 }
 
 // --- High fidelity SQL-to-TypeScript mapping objects ---
@@ -49,6 +80,11 @@ const mapTenantToRow = (t: Tenant) => ({
   subscriptionPlan: t.subscription_plan,
   subscriptionStatus: t.subscription_status,
   createdAt: t.created_at,
+  logoUrl: t.logo_url || null,
+  customAiInstructions: t.custom_ai_instructions || null,
+  physicalAddress: t.physical_address || null,
+  phoneNumber: t.phone_number || null,
+  emailAddress: t.email_address || null,
 });
 const mapRowToTenant = (r: any): Tenant => ({
   tenant_id: r.tenantId,
@@ -57,6 +93,11 @@ const mapRowToTenant = (r: any): Tenant => ({
   subscription_plan: r.subscriptionPlan as SubscriptionPlan,
   subscription_status: r.subscriptionStatus,
   created_at: r.createdAt,
+  logo_url: r.logoUrl || undefined,
+  custom_ai_instructions: r.customAiInstructions || undefined,
+  physical_address: r.physicalAddress || undefined,
+  phone_number: r.phoneNumber || undefined,
+  email_address: r.emailAddress || undefined,
 });
 
 const mapUserToRow = (u: User) => ({
@@ -675,7 +716,8 @@ const defaultSeedData = (): SchemaSim => {
     workflows,
     orders,
     riders,
-    payments
+    payments,
+    industryTemplates: defaultIndustryTemplates
   };
 };
 
@@ -690,6 +732,7 @@ class SimulatedDB {
 
   private async init() {
     try {
+      pgDbConnectionActive = true;
       // Create tables first by pulling or checking active databases
       const pgTenants = await pgDb.select().from(schema.tenants);
       if (pgTenants.length === 0) {
@@ -758,12 +801,15 @@ class SimulatedDB {
         orders: rowsOrders.map(mapRowToOrder),
         riders: rowsRiders.map(mapRowToRider),
         payments: rowsPayments.map(mapRowToPayment),
+        industryTemplates: defaultIndustryTemplates,
       };
 
       this.isLoaded = true;
       console.log('Synchronized complete data structures from Cloud SQL.');
       this.saveLocalBackup();
     } catch (e) {
+      pgDbConnectionActive = false;
+      this.isLoaded = false;
       console.error('Postgres loading failed; running fallback offline-cache mode:', e);
       this.loadLocalBackup();
     }
@@ -785,11 +831,15 @@ class SimulatedDB {
           workflows: parsed.workflows || [],
           orders: parsed.orders || [],
           riders: parsed.riders || [],
-          payments: parsed.payments || []
+          payments: parsed.payments || [],
+          industryTemplates: parsed.industryTemplates || defaultIndustryTemplates
         };
+      } else {
+        this.data.industryTemplates = defaultIndustryTemplates;
       }
     } catch (e) {
       console.error('Local backup parse error:', e);
+      this.data.industryTemplates = defaultIndustryTemplates;
     }
   }
 
@@ -902,97 +952,26 @@ class SimulatedDB {
 
     let kbText = '';
     if (preload_templates) {
-      switch (t.industry_type) {
-        case 'delivery':
-          kbText = `[${t.company_name} Delivery and Dispatch Policy Manual]
-- Operational Base: Kampala Central, serving all zones.
-- Base Dispatch Price: UGX 4,000 within Kampala central standard zones.
-- Distance Rate: UGX 1,500 per kilometer calculated automatically via maps coordinates.
-- Cargo Limit: Safe motorcycle couriers limited to parcels under 15KG.
-- Main Coverage Zones: Ntinda, Nakasero, Kololo, Muyenga, Makerere, Lubaga, Bugolobi, Wandegeya, Nakawa, Kabalagala, Mutungo, Naguru, Jinja Road, Kampala.
-- Return/Cancellation Policy: Cancellations processed before courier dispatch are 100% free. If courier is already moving, a standard UGX 2,000 callback fee applies.`;
-          break;
-        case 'school':
-          kbText = `[${t.company_name} Academic Guide and Circular Prospectus]
-- Current Term: Term 2 2026 Academic Year.
-- Boarding Section Fees: UGX 1,800,000 per term covers accommodation, tuition, text utilities, and wellness checkups.
-- Day Scholars Tuition: UGX 1,100,000 per term including hot lunch.
-- Admission Registration: Open for Senior One (S1), Senior Two (S2), Senior Three (S3) boarding section, and Senior Five (S5).
-- Payment Outlets: Pay directly via Centenary Bank, Stanbic Bank, or our standard Merchant Code: 4321 (MTN Pay / Airtel Pay).
-- Visitation Rules: Visiting day is every first Sunday of the month from 10:00 AM to 5:00 PM. Parents must carry student ID cards.`;
-          break;
-        case 'clinic':
-          kbText = `[${t.company_name} Diagnostic Services and Practitioner Board]
-- Medical Consultation Standard Fee: UGX 50,000 for standard general practitioner checkups.
-- Dental Department: Led by Dr. Brenda Namaganda (Available Mon-Fri 8:00 AM to 5:00 PM) for extractions, dental implants, teeth whitening, and scaling services.
-- Pediatrics Department: Led by Dr. Timothy Ssebunya (Available Mon-Sat 9:00 AM to 6:00 PM) covering child immunizations, growth monitoring, and baby checkups.
-- General Medicine Department: Led by Dr. Jude Kato (24/7 emergency care active).
-- Physiotherapy Services: Led by Dr. Arthur (Available Tuesday and Thursday afternoon 1:00 PM to 5:00 PM).
-- Common Diagnostics & Scans: Full blood count (UGX 25,000), Malaria rapid test (UGX 10,000), Ultrasound scan (UGX 45,000), Typhoid test (UGX 15,000).`;
-          break;
-        case 'hotel':
-          kbText = `[${t.company_name} Room Rates, Reservations, and Guest Policy]
-- Check-in Hour: 12:00 PM (Noon). Check-out Deadline: 10:00 AM.
-- Standard Single Room: UGX 120,000 per night, including a standard hot breakfast.
-- Deluxe Twin Room: UGX 220,000 per night with standard breakfast and free access to health fitness club.
-- Executive Sovereign Suite: UGX 450,000 per night with minibar, high-speed fiber Wi-Fi, premium views, and complimentary airport shuttle.
-- Pearl Dining Restaurant: Kitchen open 24/7. Room service orders are dialable via intercom code 101.
-- Airport Shuttle: Departs daily to Entebbe International Airport every 3 hours starting at 4:30 AM. Reservations required 12 hours in advance.`;
-          break;
-        case 'real_estate':
-          kbText = `[${t.company_name} Properties Directory and Viewing Schedules]
-- Featured Ntinda Offices: Ground-floor corporate spaces. Standard rent is UGX 1,200,000 per month. Water and secure guard patrol included.
-- Kololo Executive Apartments: 2-bedroom executive duplex apartments, secure electric fencing, swimming pool, premium parking at UGX 2,500,000 per month.
-- Land Plots for Sale: Titled plots in Gayaza and Mukono (standard dimensions 50ft x 100ft) start from UGX 18,000,000 with clean land registry deeds.
-- Site Visiting Tours: Held every Saturday. Meeting point is at our central desk at 9:00 AM. Booking site tours requires customer contact verification.`;
-          break;
-        case 'sacco':
-          kbText = `[${t.company_name} Financial Services and SACCO Dividend Guide]
-- Share Capital Entry: Mandatory minimum of 20 shares at UGX 20,000 per share to unlock premium credit lines.
-- Voluntary Savings Interest: Earns 5.5% locked annual compound interest paid out every November.
-- SACCO Dividends: Approved annual dividends of 12% on share capital distributed to active members in December.
-- Emergency Short Loans: Maximum loan of UGX 1,500,000, flat 1.5% interest rate, repayable within 6 months.
-- Development Capital Loans: Access up to 3x your total savings amount. Disbursed cleanly within 48 business hours with standard 2 guarantors.`;
-          break;
-        case 'retail':
-          kbText = `[${t.company_name} Stock Inventory, Branch Directories, and Invoice Rules]
-- Central Branch: Kampala Nakasero Market Lane (Open Monday to Saturday 8:00 AM to 7:00 PM).
-- Wholesale Supply Office accessories: Standard digital copying papers, office stationery, customized promotional uniforms.
-- Stock Inquiries: Customers can query stock availability, sizes, and shipping weights live with the AI dispatcher.
-- Return/Exchange Policy: Exchanges permitted within 3 calendar days of purchase upon presentation of the physical cash receipt.
-- Corporate Discounts: Bulk purchases on items worth over UGX 500,000 earn an immediate 10% cash discount.`;
-          break;
-        case 'restaurant':
-          kbText = `[${t.company_name} Dinner Menu, Daily Specials, and Booking Policies]
-- Kitchen Hours: Daily from 10:00 AM to 11:30 PM.
-- Fast Foods selection: Cheesy beef burger (UGX 18,000), Mega pepperoni pizza (UGX 22,000), Chicken nuggets with French fries (UGX 16,000).
-- Traditional Ugandan Delicacies: Chicken luwombo with organic matooke, steamed rice, and groundnut paste (UGX 15,000).
-- Coffee and beverages: Espresso (UGX 6,000), Iced Vanilla Latte (UGX 8,500), Organic local Passion fruit juice (UGX 5,000).
-- Table Reservation Policy: Free of charge. Tables held for a maximum of 20 minutes from the reserved schedule.
-- Takeaway Deliveries: Outward parcel dispatch is powered by our partner Kampala Express Logistics rider team.`;
-          break;
-        case 'hardware':
-          kbText = `[${t.company_name} Construction Materials and Wholesales Catalog]
-- Cement Supply: Portland cement Cement Grade 32.5R at UGX 38,000 per bag. Grade 42.5R high strength at UGX 42,000 per bag.
-- Iron Sheets: Pre-painted metallic maroon corrugated sheets (30 Gauge) at UGX 48,000 per standard sheet.
-- Domestic Wiring: Heavy-duty single-core copper wires (1.5mm) at UGX 95,000 per standard roll.
-- Paint drums: Premium high-gloss weather-guard emulsion (20 Litres) at UGX 140,000.
-- Logistics Dispatch: Heavy items can be dispatched to construction sites using our local flatbed 4-tonne Isuzu trucks at reasonable rates.`;
-          break;
-        case 'security':
-          kbText = `[${t.company_name} Security Guarding Services and Rapid Response Guide]
-- Corporate Guard Patrol: Trained professional security officers stationed at premises starting at UGX 350,000 per guard monthly turn.
-- Residential Gate Sentries: Daytime and nighttime split shifts, with verified background checks and supervisor audits at UGX 280,000.
-- VIP Bodyguard Escorts: Standard daily premium rates starting at UGX 150,000 per direct certified protection personnel.
-- Electric Fence Installations: High-tension razor wires, warning sirens, fallback battery backups starting at UGX 1,800,000 for standard residential plots.
-- Rapid Patrol Response Dispatch: Linked 24/7 with municipal security cells. Standard panic buttons prompt vehicle dispatch in under 8 minutes.`;
-          break;
-        default:
-          kbText = `[${t.company_name} General Support FAQ]
+      const template = this.data.industryTemplates.find((tpl) => tpl.id === t.industry_type);
+      if (template) {
+        kbText = `[${t.company_name} - ${template.name} Corporate Knowledge Base]
+- Industry Sector: ${template.name}
+- Domain Terminology: ${template.terminology.join(', ')}
+
+[Our Specialized Typical Services]
+${template.services.map((s) => `- ${s}`).join('\n')}
+
+[Preloaded Frequently Asked Questions & Answers]
+${template.faqs.map((f) => `Q: ${f.question}\nA: ${f.answer}`).join('\n\n')}
+
+[AI Sentry Core Industry Guidelines]
+${template.ai_instructions}`;
+      } else {
+        // Fallback for custom undefined industries
+        kbText = `[${t.company_name} Business Training Dossier]
 - Operational Hour: Monday to Friday 8:00 AM to 5:00 PM.
-- Core Industry Focus: Standard client support inside the ${t.industry_type} sector.
-- Contacts: For support reach out to our team.`;
-          break;
+- Primary Sector Focus: Customer support in the ${t.industry_type} industry.
+- Contacts: Reach out to our human staff for escalation queries.`;
       }
     } else {
       kbText = `[${t.company_name} Draft Custom Training Log]
@@ -1149,6 +1128,10 @@ This tenant was created with custom training choice. Please update this knowledg
   // --- Conversations ---
   public getConversations(tenantId: string): Conversation[] {
     return this.data.conversations.filter((c) => c.tenant_id === tenantId);
+  }
+
+  public getConversation(convId: string): Conversation | undefined {
+    return this.data.conversations.find((c) => c.id === convId);
   }
 
   public async getOrCreateConversation(tenantId: string, customerId: string, channel: Conversation['channel']): Promise<Conversation> {
@@ -1515,6 +1498,71 @@ This tenant was created with custom training choice. Please update this knowledg
       conversations_by_channel: channels,
       by_industry: indCount
     };
+  }
+
+  // --- Industry Templates ---
+  public getIndustryTemplates(): IndustryTemplate[] {
+    return this.data.industryTemplates || [];
+  }
+
+  public getIndustryTemplate(id: string): IndustryTemplate | undefined {
+    return this.data.industryTemplates.find((t) => t.id === id);
+  }
+
+  public addIndustryTemplate(template: IndustryTemplate): IndustryTemplate {
+    if (!template.id) {
+      template.id = template.name.toLowerCase().replace(/[^a-z0-9]+/g, '_');
+    }
+    const idx = this.data.industryTemplates.findIndex(t => t.id === template.id);
+    if (idx !== -1) {
+      this.data.industryTemplates[idx] = template;
+    } else {
+      this.data.industryTemplates.push(template);
+    }
+    this.save();
+    return template;
+  }
+
+  public updateIndustryTemplate(id: string, updates: Partial<IndustryTemplate>): IndustryTemplate | undefined {
+    const template = this.data.industryTemplates.find((t) => t.id === id);
+    if (template) {
+      Object.assign(template, updates);
+      this.save();
+      return template;
+    }
+    return undefined;
+  }
+
+  public deleteIndustryTemplate(id: string) {
+    this.data.industryTemplates = this.data.industryTemplates.filter((t) => t.id !== id);
+    this.save();
+  }
+
+  // --- Tenant Settings Support ---
+  public updateTenant(id: string, updates: Partial<Tenant>): Tenant | undefined {
+    const tenant = this.data.tenants.find((t) => t.tenant_id === id);
+    if (tenant) {
+      Object.assign(tenant, updates);
+      
+      pgDb.update(schema.tenants)
+        .set({
+          companyName: tenant.company_name,
+          industryType: tenant.industry_type,
+          subscriptionPlan: tenant.subscription_plan,
+          subscriptionStatus: tenant.subscription_status,
+          logoUrl: tenant.logo_url || null,
+          customAiInstructions: tenant.custom_ai_instructions || null,
+          physicalAddress: tenant.physical_address || null,
+          phoneNumber: tenant.phone_number || null,
+          emailAddress: tenant.email_address || null
+        })
+        .where(eq(schema.tenants.tenantId, id))
+        .catch((e) => console.error('Error updating tenant in sqlite/postgres:', e));
+
+      this.save();
+      return tenant;
+    }
+    return undefined;
   }
 }
 

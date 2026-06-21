@@ -350,17 +350,31 @@ export default function UnifiedInbox({ tenantId, conversations, customers, onRef
                         <p className="whitespace-pre-wrap text-[11px] leading-relaxed">{m.content}</p>
  
                         {/* Visual details on execution tools triggers in messaging card */}
-                        {m.metadata?.workflow_triggered && (
-                          <div className={`mt-3 pt-2 border-t border-dashed text-[9px] flex flex-col gap-1.5 ${isAi ? 'border-cyan-500/30 text-cyan-400' : 'border-white/10 text-white/60'}`}>
-                            <span className="flex items-center gap-1 font-bold">
-                              <Zap className="w-3 h-3 text-cyan-400 animate-pulse" />
-                              Workflow Activated: {m.metadata.workflow_triggered}
-                            </span>
-                            {m.metadata?.tool_calls && m.metadata.tool_calls.map((t: any, tid: number) => (
-                              <span key={tid} className="block text-[8px] opacity-80 leading-tight">
-                                Method call payload: {t.name}({JSON.stringify(t.args)})
-                              </span>
-                            ))}
+                        {(m.metadata?.workflow_triggered || m.metadata?.rag_references) && (
+                          <div className={`mt-3 pt-2 border-t border-dashed text-[9px] flex flex-col gap-1.5 ${isAi ? 'border-cyan-500/30 text-cyan-400' : 'border-white/10 text-white/50'}`}>
+                            {m.metadata?.workflow_triggered && (
+                              <>
+                                <span className="flex items-center gap-1 font-bold">
+                                  <Zap className="w-3 h-3 text-cyan-400 animate-pulse" />
+                                  Workflow Activated: {m.metadata.workflow_triggered}
+                                </span>
+                                {m.metadata?.tool_calls && m.metadata.tool_calls.map((t: any, tid: number) => (
+                                  <span key={tid} className="block text-[8px] opacity-80 leading-tight pl-4">
+                                    Method call payload: {t.name}({JSON.stringify(t.args)})
+                                  </span>
+                                ))}
+                              </>
+                            )}
+                            {m.metadata?.rag_references && (
+                              <div className="flex flex-col gap-1 text-[9px]">
+                                <span className="font-bold text-cyan-400 flex items-center gap-1">
+                                  📚 Matched RAG Document Reference:
+                                </span>
+                                <p className="opacity-80 text-[9px] leading-relaxed whitespace-pre-wrap pl-3 border-l border-white/10">
+                                  {m.metadata.rag_references.replace(/^[\s\n]*📌 \*For your reference:\*\n?/, '')}
+                                </p>
+                              </div>
+                            )}
                           </div>
                         )}
                       </div>

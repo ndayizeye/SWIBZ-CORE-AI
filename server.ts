@@ -109,10 +109,78 @@ async function startServer() {
     }
   });
 
-  // Close conversation
-  app.post('/api/conversation/:id/resolve', (req, res) => {
+  // --- Dynamic Industry Templates Management (CRUD) ---
+  app.get('/api/admin/industry-templates', (req, res) => {
     try {
+      res.json({ success: true, templates: db.getIndustryTemplates() });
+    } catch (e: any) {
+      res.status(500).json({ error: e.message });
+    }
+  });
+
+  app.post('/api/admin/industry-templates', (req, res) => {
+    try {
+      const template = req.body;
+      if (!template.name) {
+        return res.status(400).json({ error: 'Template corporate name is required.' });
+      }
+      const added = db.addIndustryTemplate(template);
+      res.status(201).json({ success: true, template: added });
+    } catch (e: any) {
+      res.status(500).json({ error: e.message });
+    }
+  });
+
+  app.put('/api/admin/industry-templates/:id', (req, res) => {
+    const { id } = req.params;
+    try {
+      const updated = db.updateIndustryTemplate(id, req.body);
+      if (!updated) {
+        return res.status(404).json({ error: `Template ${id} not found.` });
+      }
+      res.json({ success: true, template: updated });
+    } catch (e: any) {
+      res.status(500).json({ error: e.message });
+    }
+  });
+
+  app.delete('/api/admin/industry-templates/:id', (req, res) => {
+    const { id } = req.params;
+    try {
+      db.deleteIndustryTemplate(id);
+      res.json({ success: true, message: `Industry template ${id} deleted successfully.` });
+    } catch (e: any) {
+      res.status(500).json({ error: e.message });
+    }
+  });
+
+  // --- Tenant Brand and Contact Profile Customization ---
+  app.put('/api/tenant/:id/profile', (req, res) => {
+    const { id } = req.params;
+    try {
+      const updated = db.updateTenant(id, req.body);
+      if (!updated) {
+        return res.status(404).json({ error: `Tenant ${id} not registered.` });
+      }
+      res.json({ success: true, tenant: updated });
+    } catch (e: any) {
+      res.status(500).json({ error: e.message });
+    }
+  });
+
+  // Close conversation
+  app.post('/api/conversation/:id/resolve', async (req, res) => {
+    try {
+      const conv = db.getConversation(req.params.id);
       db.closeConversation(req.params.id);
+      
+      if (conv) {
+        // Automatically learn/mine from successful conversations in the background to build the knowledge base
+        learnFromConversations(conv.tenant_id).catch((err) => {
+          console.error('Error auto-learning from resolved conversation:', err);
+        });
+      }
+
       res.json({ success: true });
     } catch (e: any) {
       res.status(500).json({ error: e.message });

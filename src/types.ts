@@ -13,7 +13,18 @@ export type IndustryType =
   | 'retail'
   | 'restaurant'
   | 'hardware'
-  | 'security';
+  | 'security'
+  | 'software'
+  | 'law_firm'
+  | 'automotive'
+  | 'beauty_spa'
+  | 'clean_energy'
+  | 'agribusiness'
+  | 'fitness_gym'
+  | 'tourism_safari'
+  | 'events_decor'
+  | 'waste_mgmt'
+  | string;
 
 export type SubscriptionPlan = 'starter' | 'professional' | 'enterprise';
 
@@ -26,6 +37,12 @@ export interface Tenant {
   subscription_plan: SubscriptionPlan;
   subscription_status: 'active' | 'past_due' | 'trial';
   created_at: string;
+  // Dynamic brand customization settings
+  logo_url?: string;
+  custom_ai_instructions?: string;
+  physical_address?: string;
+  phone_number?: string;
+  email_address?: string;
 }
 
 export interface User {
@@ -175,4 +192,16 @@ export interface AnalyticsSummary {
   by_industry: {
     [key in IndustryType]?: number;
   };
+}
+
+export interface IndustryTemplate {
+  id: string;
+  name: string;
+  terminology: string[];
+  services: string[];
+  faqs: { question: string; answer: string }[];
+  suggested_responses: string[];
+  actions: string[];
+  lead_capture_fields: string[];
+  ai_instructions: string;
 }

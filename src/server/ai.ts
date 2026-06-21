@@ -8,8 +8,12 @@ import { db } from './db.js';
 import { Conversation, Message, Customer, IndustryType } from '../types.js';
 
 let aiInstance: GoogleGenAI | null = null;
+let geminiApiQuotaExceeded = false;
 
 function getAIClient(): GoogleGenAI | null {
+  if (geminiApiQuotaExceeded) {
+    return null;
+  }
   const key = process.env.GEMINI_API_KEY;
   if (!key || key === 'MY_GEMINI_API_KEY') {
     return null;
@@ -58,6 +62,48 @@ function findRAGMatches(tenantId: string, query: string): string[] {
   }
 
   return matches;
+}
+
+function cleanAndSummarizeKB(matches: string[], query: string): string {
+  if (matches.length === 0) return '';
+  
+  // Strip tags like [Knowledge Base Document: ...] / [Knowledge Base General Reference: ...]
+  const rawText = matches[0]
+    .replace(/\[Knowledge Base [^\]]+\]/g, '')
+    .trim();
+  
+  // Split into lines/bullets
+  let lines = rawText.split('\n').map(l => l.trim()).filter(l => l.length > 0);
+  
+  const normQuery = query.toLowerCase();
+  
+  // Find lines that are highly relevant to the query words
+  const queryWords = normQuery.split(/[\s,.\-!?]+/).filter(w => w.length > 3);
+  
+  let relevantLines = lines.filter(line => {
+    const lineLower = line.toLowerCase();
+    // Don't include titles/subtitles like [hilton hotel Room Rates...]
+    if (line.startsWith('[') && line.endsWith(']')) return false;
+    return queryWords.some(word => lineLower.includes(word));
+  });
+  
+  // If no lines matched specifically, choose up to 2 non-bracketed bulleted/informative lines
+  if (relevantLines.length === 0) {
+    relevantLines = lines.filter(line => !line.startsWith('[') && !line.endsWith(']')).slice(0, 2);
+  } else {
+    // limit to 2 lines max for precision
+    relevantLines = relevantLines.slice(0, 2);
+  }
+  
+  if (relevantLines.length === 0) return '';
+  
+  // Clean up bullets and format beautifully with emoji
+  const bulletDetails = relevantLines.map(line => {
+    let cleanLine = line.replace(/^[-*•\s\d.]+\s*/, '').trim();
+    return `• ${cleanLine}`;
+  }).join('\n');
+  
+  return `\n\n📌 *For your reference:*\n${bulletDetails}`;
 }
 
 // Kampala coordinates mockup for distance calculation to allow real distance metrics
@@ -229,6 +275,7 @@ interface AIResponsePayload {
   toolCalls?: { name: string; args: any; result: any }[];
   workflowTriggered?: string;
   customerLeadScore?: number;
+  ragReferences?: string;
 }
 
 // Fallback rule base conversational engine when Gemini API Key is not set or errors
@@ -240,6 +287,14 @@ export function processConversationalSimulation(
   isReactivated: boolean = false
 ): AIResponsePayload {
   const normInput = query.toLowerCase();
+
+  const tenant = db.getTenant(tenantId);
+  const companyName = tenant?.company_name || (
+    industry === 'delivery' ? 'Kampala Express' :
+    industry === 'clinic' ? 'Victoria Wellness' :
+    industry === 'school' ? 'Green Hill Academy' :
+    'Our Business'
+  );
 
   // --- 1. HISTORICAL CONTEXT & JUDGMENT ---
   // Retrieve chronological message history
@@ -378,13 +433,13 @@ Based on our conversation history, I see you were exploring ${hint || 'our busin
 
   // Check if confirming a previous option using historical information
   const isAffirmation = normInput.includes('confirm') || 
-                        normInput.includes('yes') || 
-                        normInput.includes('ok') || 
+                        /\byes\b/i.test(normInput) || 
+                        /\bok\b/i.test(normInput) || 
+                        /\bokay\b/i.test(normInput) || 
                         normInput.includes('go ahead') || 
                         normInput.includes('book it') || 
-                        normInput.includes('schedule') ||
-                        normInput === 'y' ||
-                        normInput === 'ok';
+                        /\bschedule\b/i.test(normInput) ||
+                        normInput === 'y';
 
   // --- 2. EVALUATE INTENT & FUNCTION CALLING ---
   const toolCalls: any[] = [];
@@ -393,10 +448,35 @@ Based on our conversation history, I see you were exploring ${hint || 'our busin
 
   // Find RAG references
   const matches = findRAGMatches(tenantId, query);
-  const ragSnippet = matches.length > 0 ? `\n\n[Matched knowledge base facts]:\n${matches[0]}` : '';
+  const isGreeting = normInput === 'hi' || normInput === 'hello' || normInput === 'hey' || normInput === 'yo' || normInput.includes('start') || normInput.includes('get started');
+  // Format dynamic reference snippet naturally from the knowledge base using cleanAndSummarizeKB
+  const ragSnippet = cleanAndSummarizeKB(matches, query);
 
   if (industry === 'delivery') {
-    if (normInput.includes('deliver') || normInput.includes('send') || normInput.includes('pickup') || normInput.includes('dispatch') || normInput.includes('book') || isAffirmation) {
+    // 1. Precise keyword declarations based on user intent rules
+    const actionWords = ['send', 'deliver', 'dispatch', 'pick up', 'pickup', 'drop off', 'dropoff', 'ship', 'bring', 'carry', 'collect', 'take', 'move', 'transfer'];
+    const locationWords = ['from', 'to', 'between', 'pickup', 'drop-off', 'dropoff', 'destination', 'location', 'address', 'area', 'stage', 'zone'];
+    const itemWords = ['package', 'parcel', 'item', 'box', 'bag', 'envelope', 'document', 'food', 'goods', 'stuff', 'things', 'order'];
+    const paymentWords = ['cost', 'price', 'fare', 'charge', 'fee', 'rate', 'how much', 'quote', 'amount', 'pay'];
+
+    const hasWord = (list: string[]) => {
+      return list.some(w => {
+        const escaped = w.replace(/[-\/\\^$*+?.()|[\]{}]/g, '\\$&');
+        const regex = w.includes(' ') || w.includes('-')
+          ? new RegExp(escaped, 'i')
+          : new RegExp('\\b' + escaped + '\\b', 'i');
+        return regex.test(normInput);
+      });
+    };
+
+    const hasAction = hasWord(actionWords);
+    const hasLocation = hasWord(locationWords);
+    const hasItem = hasWord(itemWords);
+
+    // Order booking requires: At least 1 action word + 1 location word + 1 item word
+    const meetsOrderRequirement = hasAction && hasLocation && hasItem;
+
+    if (meetsOrderRequirement || isAffirmation) {
       // Check if we already have specific pickup/dropoff in query
       const pMatch = normInput.match(/(?:from)\s+([a-z\s]+?)\s+(?:to)/i);
       const dMatch = normInput.match(/(?:to)\s+([a-z\s]+?)(?:$|\s|for|with|and)/i);
@@ -409,8 +489,8 @@ Based on our conversation history, I see you were exploring ${hint || 'our busin
       toolCalls.push({ name: 'create_delivery_order', args: { pickup, dropoff, package_details: details }, result });
 
       workflowTriggered = 'Automated Delivery Booking Workflow';
-      reply = `✨ *Swibz Delivery Order Booking*\n\nScheduled courier dispatch:\n- *Order Ref:* ${result.order_id}\n- *Pickup:* ${result.pickup}\n- *Dropoff:* ${result.dropoff}\n- *Distance:* ${result.distance_km} KM\n- *Est. Charge:* UGX ${result.fare_ugx.toLocaleString()}\n- *Rider Assigned:* ${result.assigned_rider || 'Assigning nearest dispatcher'}\n- *Status:* In Transit\n\nYou will receive real-time rider coordinates and SMS updates. Shipping with Kampala Express!`;
-    } else if (normInput.includes('price') || normInput.includes('cost') || normInput.includes('fare') || normInput.includes('how much')) {
+      reply = `✨ *Swibz Delivery Order Booking*\n\nScheduled courier dispatch:\n- *Order Ref:* ${result.order_id}\n- *Pickup:* ${result.pickup}\n- *Dropoff:* ${result.dropoff}\n- *Distance:* ${result.distance_km} KM\n- *Est. Charge:* UGX ${result.fare_ugx.toLocaleString()}\n- *Rider Assigned:* ${result.assigned_rider || 'Assigning nearest dispatcher'}\n- *Status:* In Transit\n\nYou will receive real-time rider coordinates and SMS updates. Shipping with ${companyName}!`;
+    } else if (hasWord(paymentWords) || normInput.includes('how much') || normInput.includes('price')) {
       const pMatch = normInput.match(/(?:from)\s+([a-z\s]+?)\s+(?:to)/i);
       const dMatch = normInput.match(/(?:to)\s+([a-z\s]+?)(?:$|\s|for|with|and)/i);
 
@@ -422,11 +502,19 @@ Based on our conversation history, I see you were exploring ${hint || 'our busin
 
       workflowTriggered = 'Pricing Matrix Calculation Workflow';
       reply = `📊 *Delivery Fare Calculation Summary*\n\nFare from *${result.pickup}* to *${result.dropoff}*:\n- *Distance:* ${result.distance_km} KM\n- *Estimated Duration:* ${result.duration_mins} mins\n- *Total Fare:* UGX ${result.calculated_fare_ugx.toLocaleString()} (calculated as Base Fee UGX 4,000 + ${result.distance_km} KM × UGX 1,500/KM).\n\nWould you like me to book a rider right away? Just say "yes please" or "book it".`;
+    } else if (normInput.includes('direction') || normInput.includes('location') || normInput.includes('office') || normInput.includes('where is') || normInput.includes('where are')) {
+      reply = `📍 *${companyName} Headquarters & Offices*\n\nOur central office is located at **${tenant?.physical_address || 'Nakasero, Kampala (near Nakasero Market)'}** (Ph: ${tenant?.phone_number || 'N/A'}). We operate 24/7 across all major zones.\n\nLet me know if you would like me to calculate a price or schedule a delivery courier for you!`;
+    } else if (isGreeting) {
+      reply = `Hello! I am ${companyName}'s Swibz AI Dispatcher. How can I assist you today? I can help you with:\n1. Calculating delivery prices (say e.g., "how much is delivery from Ntinda to Kololo?")\n2. Booking a package courier (say e.g., "Deliver package from Ntinda to Kololo")`;
     } else {
-      reply = `Hello! I am Kampala Express's Swibz AI Dispatcher. How can I assist you today? I can help you with:\n1. Calculating delivery prices (say e.g., "how much is delivery from Ntinda to Kololo?")\n2. Booking a package courier (say e.g., "Deliver package from Ntinda to Kololo")${ragSnippet}`;
+      if (ragSnippet) {
+        reply = `Hello! I am ${companyName}'s Swibz AI Dispatcher.`;
+      } else {
+        reply = `Hello! I am ${companyName}'s Swibz AI Dispatcher. To help you with delivery booking or quotes, just specify action, items, and the pickup/drop-off locations. For other operations queries, feel free to ask details!`;
+      }
     }
   } else if (industry === 'clinic') {
-    if (normInput.includes('appointment') || normInput.includes('booking') || normInput.includes('dental') || normInput.includes('checkup') || normInput.includes('reserve') || normInput.includes('visit') || isAffirmation) {
+    if (normInput.includes('appointment') || normInput.includes('booking') || normInput.includes('dental') || normInput.includes('checkup') || normInput.includes('reserve') || normInput.includes('visit') || isAffirmation || normInput.includes('book') || normInput.includes('schedule') || normInput.includes('register') || normInput.includes('slot') || normInput.includes('doctor') || normInput.includes('dentist')) {
       const isDental = normInput.includes('dental') || normInput.includes('teeth') || lastDepartment === 'dental';
       const dept = isDental ? 'dental' : 'general';
 
@@ -435,9 +523,15 @@ Based on our conversation history, I see you were exploring ${hint || 'our busin
       toolCalls.push({ name: 'create_clinic_booking', args: { department: dept, date: 'June 19th', time: '10:00 AM' }, result });
 
       workflowTriggered = 'Clinic Appointment Booking Workflow';
-      reply = `🩺 *Victoria Wellness Appointments System*\n\nUsing history judgment to confirm, your clinic appointment has been successfully scheduled:\n- *Booking Ref:* ${result.booking_id}\n- *Physician:* ${result.doctor}\n- *Specialty:* ${result.department.toUpperCase()}\n- *Date:* ${result.date}\n- *Time:* ${result.time}\n\n*Important Instructions:* ${result.instructions}\n\nDo you need help checking credentials or other doctor available hours?`;
+      reply = `🩺 *${companyName} Appointments System*\n\nUsing history judgment to confirm, your clinic appointment has been successfully scheduled:\n- *Booking Ref:* ${result.booking_id}\n- *Physician:* ${result.doctor}\n- *Specialty:* ${result.department.toUpperCase()}\n- *Date:* ${result.date}\n- *Time:* ${result.time}\n\n*Important Instructions:* ${result.instructions}\n\nDo you need help checking credentials or other doctor available hours?`;
+    } else if (isGreeting) {
+      reply = `Greetings from ${companyName}! I am your AI nurse representative. I can assist you with:\n1. Booking medical consultations / dental checkups (say e.g. "Do you have dental slots tomorrow?")\n2. Inquiry about active specialist routines & clinic services.`;
     } else {
-      reply = `Greetings from Victoria Wellness Clinic Center! I am your AI nurse representative. I can assist you with:\n1. Booking medical consultations / dental checkups (say e.g. "Do you have dental slots tomorrow?")\n2. Inquiry about active specialist routines & clinic services.${ragSnippet}`;
+      if (ragSnippet) {
+        reply = `Thank you for your message. I am here to assist you at ${companyName}.`;
+      } else {
+        reply = `Welcome to ${companyName}. How can I help you today? I can book appointments or assist you with looking up clinic service packages.`;
+      }
     }
   } else if (industry === 'school') {
     if (normInput.includes('fees') || normInput.includes('balance') || normInput.includes('outstanding') || normInput.includes('owing') || isAffirmation) {
@@ -445,76 +539,158 @@ Based on our conversation history, I see you were exploring ${hint || 'our busin
       toolCalls.push({ name: 'verify_fee_balance', args: { student_name: lastStudentName }, result });
 
       workflowTriggered = 'Student Financial Inquiry Chain';
-      reply = `🏫 *Green Hill Academy FinCenter*\n\nHere is the financial statement balance details for *${result.student_name}*:\n- *Term Tuition Cost:* UGX ${result.tuition_total_ugx.toLocaleString()}\n- *Tuition Paid:* UGX ${result.amount_paid_ugx.toLocaleString()}\n- *Outstanding owing Balance:* UGX ${result.balance_outstanding_ugx.toLocaleString()}\n- *Status Indicator:* ${result.status}\n- *Due Date:* ${result.due_date}\n\nPayments can be submitted via MTN Pay with merchant ID 4321, or direct Stanbic Bank deposits. Let me know if you would like me to compile school circular documentation!`;
-    } else if (normInput.includes('admissions') || normInput.includes('admission') || normInput.includes('enroll') || normInput.includes('school vacancy')) {
-      reply = `Boarding admissions are currently open for S1, S2, S3 & S5. The registration process requires filling standard entry forms and submitting term academic papers. Tuition remains UGX 1,800,000 inclusive of lodging expenses. Or say "fees balance info" to see statement details!${ragSnippet}`;
+      reply = `🏫 *${companyName} FinCenter*\n\nHere is the financial statement balance details for *${result.student_name}*:\n- *Term Tuition Cost:* UGX ${result.tuition_total_ugx.toLocaleString()}\n- *Tuition Paid:* UGX ${result.amount_paid_ugx.toLocaleString()}\n- *Outstanding owing Balance:* UGX ${result.balance_outstanding_ugx.toLocaleString()}\n- *Status Indicator:* ${result.status}\n- *Due Date:* ${result.due_date}\n\nPayments can be submitted via MTN Pay with merchant ID 4321, or direct Stanbic Bank deposits. Let me know if you would like me to compile school circular documentation!`;
+    } else if (normInput.includes('admissions') || normInput.includes('admission') || normInput.includes('enroll') || normInput.includes('school vacancy') || normInput.includes('join') || normInput.includes('son') || normInput.includes('daughter') || normInput.includes('child') || normInput.includes('apply') || normInput.includes('register') || normInput.includes('vacancy') || normInput.includes('vacancies') || normInput.includes('schooling') || normInput.includes('grade') || normInput.includes('class') || normInput.includes('admit')) {
+      reply = `Boarding admissions are currently open for S1, S2, S3 & S5. The registration process requires filling standard entry forms and submitting term academic papers. Tuition remains UGX 1,800,000 inclusive of lodging expenses. Or say "fees balance info" to see statement details!`;
+    } else if (isGreeting) {
+      reply = `Welcome to ${companyName} parent info portal. I am Swibz School AI Counselor. Ask me about school fees structures, academic calendars, boarding admissions circulars, or outstanding invoice reports!`;
     } else {
-      reply = `Welcome to Green Hill Academy parent info portal. I am Swibz School AI Counselor. Ask me about school fees structures, academic calendars, boarding admissions circulars, or outstanding invoice reports!${ragSnippet}`;
+      if (ragSnippet) {
+        reply = `Thank you for your message. I am here to assist with ${companyName} inquiries.`;
+      } else {
+        reply = `Welcome to ${companyName}. I am Swibz School AI Counselor. For other queries, feel free to ask about our enrollment procedures, calendar, or tuition values!`;
+      }
     }
   } else if (industry === 'hotel') {
-    if (normInput.includes('room') || normInput.includes('book') || normInput.includes('reservation') || normInput.includes('stay') || isAffirmation) {
+    if (normInput.includes('room') || normInput.includes('book') || normInput.includes('reservation') || normInput.includes('stay') || isAffirmation || normInput.includes('reserve') || normInput.includes('suite') || normInput.includes('accommodation') || normInput.includes('lodge')) {
       const room = normInput.includes('suite') ? 'Executive Suite' : normInput.includes('twin') ? 'Deluxe Twin' : lastRoomClass;
       reply = `🛎️ *Hotel Room Reservation Lock*\n\nYour *${room}* stay reservation is locked under contact ${customerId}:\n- *Check-in:* Tonight 12:00 PM\n- *Check-out:* 10:00 AM\n- *Daily Rate:* UGX 120,000\n- *Incl.:* Breakfast & Free Shuttle\n\nIs there anything else I can coordinate for you?`;
       workflowTriggered = 'Hotel Room Booking Workflow';
       toolCalls.push({ name: 'book_hotel_room', args: { room_type: room, days: 1 }, result: { success: true, booking_id: 'H-' + Math.random().toString(36).substring(2, 6).toUpperCase() } });
-    } else {
+    } else if (isGreeting) {
       reply = `Welcome to our Hotel and Lodging assistance desk! How can I help you? I can assist with reservation inquiries (Standard Single, Deluxe Twin, Executive Suite) or checking checkout policies.${ragSnippet}`;
+    } else {
+      if (ragSnippet) {
+        reply = `We're happy to guide you with our hotel details. ${ragSnippet}`;
+      } else {
+        reply = `Welcome to our lodging help desk. Let me know if you would like to reserve a room, check room rates, or check our boarding policies.`;
+      }
     }
   } else if (industry === 'real_estate') {
-    if (normInput.includes('listing') || normInput.includes('property') || normInput.includes('rent') || normInput.includes('site tour') || normInput.includes('visit') || isAffirmation) {
+    if (normInput.includes('listing') || normInput.includes('property') || normInput.includes('rent') || normInput.includes('site tour') || normInput.includes('visit') || isAffirmation || normInput.includes('apartment') || normInput.includes('buy') || normInput.includes('house') || normInput.includes('viewing')) {
       reply = `🏠 *Commercial Real Estate Board*\n\nSite tour registered for *${lastPropertySite}* on Saturday morning:\n- *Featured:* 2-Bed Kololo Duplex at UGX 2,500,000/mo or Ntinda offices.\n- *Tour Time:* Saturday 9:00 AM standard group viewing.\n- *Assoc Agent:* David (0772001122)\n\nLet me know if you would like me to lock this appointment!`;
       workflowTriggered = 'Properties site tour schedule';
       toolCalls.push({ name: 'schedule_property_tour', args: { location: lastPropertySite, day: 'Saturday' }, result: { success: true, tour_id: 'RE-' + Math.random().toString(36).substring(2, 6).toUpperCase() } });
-    } else {
+    } else if (isGreeting) {
       reply = `Greetings from Real Estate CRM. We offer listed apartments in Kololo (UGX 2.5M) and office spaces in Ntinda. Ask me to list vacant rentals or schedule a site tour!${ragSnippet}`;
+    } else {
+      if (ragSnippet) {
+        reply = `Thank you for your real estate inquiry. ${ragSnippet}`;
+      } else {
+        reply = `Welcome to our Real Estate CRM. I can list our current vacant properties or schedule a home site viewing tour for you!`;
+      }
     }
   } else if (industry === 'sacco') {
-    if (normInput.includes('loan') || normInput.includes('apply') || normInput.includes('borrow') || normInput.includes('balance') || normInput.includes('savings') || isAffirmation) {
+    if (normInput.includes('loan') || normInput.includes('apply') || normInput.includes('borrow') || normInput.includes('balance') || normInput.includes('savings') || isAffirmation || normInput.includes('dividend') || normInput.includes('statement') || normInput.includes('interest')) {
       reply = `💰 *SACCO Savings & Dividend desk*\n\nVerified dividend & statement parameters:\n- *Voluntary locked savings:* UGX 4,500,000\n- *Accumulated dividend rate:* 12% (UGX 540,000 due Dec)\n- *Eligible loan limit (3x savings):* UGX 13,500,000\n\nWould you like me to dispatch Emergency Loan application requirements or draft repayment circulars?`;
       workflowTriggered = 'SACCO statements check';
       toolCalls.push({ name: 'check_sacco_balance', args: { savings_limit: 4500000 }, result: { success: true } });
-    } else {
+    } else if (isGreeting) {
       reply = `Welcome to SACCO financial support board. I can verify saved capital statements, loan eligibilities, and emergency flat cash interest rates.${ragSnippet}`;
+    } else {
+      if (ragSnippet) {
+        reply = `Here is our SACCO operational knowledge details. ${ragSnippet}`;
+      } else {
+        reply = `Welcome to our SACCO office. Please ask me about voluntary savings accounts, our emergency loan multipliers, or current interest parameters.`;
+      }
     }
   } else if (industry === 'retail') {
-    if (normInput.includes('stock') || normInput.includes('item') || normInput.includes('catalog') || normInput.includes('wholesale') || isAffirmation) {
+    if (normInput.includes('stock') || normInput.includes('item') || normInput.includes('catalog') || normInput.includes('wholesale') || isAffirmation || normInput.includes('inventory') || normInput.includes('stationery') || normInput.includes('paper') || normInput.includes('purchase') || normInput.includes('order')) {
       reply = `🛍️ *Retail Branch Stocks Report*\n\nInventory lookup checked for *${lastProduct}*:\n- *Avalaiblity status:* INSTOCK\n- *Corporate pricing terms:* UGX 95,000 per roll/unit\n- *Discount offer:* 10% cash discount applies for orders above UGX 500,000\n- *Location:* Kampala Nakasero Market Branch\n\nWould you like me to process a retail delivery dispatch via transport?`;
       workflowTriggered = 'Branch Inventory Checker';
       toolCalls.push({ name: 'check_inventory_stock', args: { item: lastProduct }, result: { in_stock: true, count: 48 } });
-    } else {
+    } else if (isGreeting) {
       reply = `Hello! Welcome to our retail store support line. We have stationery, copying papers, and electronic items at our central Nakasero branch. Ask me about custom stock or exchange policies.${ragSnippet}`;
+    } else {
+      if (ragSnippet) {
+        reply = `We're happy to guide you with our stock inventories. ${ragSnippet}`;
+      } else {
+        reply = `Welcome to our retail store help desk. Ask me about stationery stock availability, catalog pricing, or Nakasero branch hours!`;
+      }
     }
   } else if (industry === 'restaurant') {
-    if (normInput.includes('menu') || normInput.includes('food') || normInput.includes('eat') || normInput.includes('dish') || normInput.includes('burger') || normInput.includes('pizza') || normInput.includes('table') || isAffirmation) {
-      reply = `🍔 *Dinner Table & Food Menu Dispatch*\n\nDinner special logged successfully:\n- *Selected Dish:* ${lastDish}\n- *Fares cost:* UGX 18,000\n- *Action:* Table reserved / Pickup delivery scheduled.\n- *Estimated Wait:* 25 minutes cooking dispatch\n\nShall we book a Kampalan Express courier rider to send this to your area?`;
+    if (normInput.includes('menu') || normInput.includes('food') || normInput.includes('eat') || normInput.includes('dish') || normInput.includes('burger') || normInput.includes('pizza') || normInput.includes('table') || isAffirmation || normInput.includes('reserve') || normInput.includes('order') || normInput.includes('hungry') || normInput.includes('dine') || normInput.includes('dinner')) {
+      reply = `🍔 *Dinner Table & Food Menu Dispatch*\n\nDinner special logged successfully:\n- *Selected Dish:* ${lastDish}\n- *Fares cost:* UGX 18,000\n- *Action:* Table reserved / Pickup delivery scheduled.\n- *Estimated Wait:* 25 minutes cooking dispatch\n\nShall we book a ${companyName} courier rider to send this to your area?`;
       workflowTriggered = 'Digital Restaurant Ordering';
       toolCalls.push({ name: 'reserve_restaurant_table', args: { food: lastDish }, result: { success: true, estimation: '25m' } });
-    } else {
+    } else if (isGreeting) {
       reply = `Welcome to our dining kitchen! Menu items: Cheesy beef burger (UGX 18k), Pepperoni Pizza (UGX 22k), Chicken luwombo (UGX 15k). Ask me to display the table calendar or dispatch orders!${ragSnippet}`;
+    } else {
+      if (ragSnippet) {
+        reply = `We're happy to assist you with dining information. ${ragSnippet}`;
+      } else {
+        reply = `Welcome to our virtual dining deck. For menu items (Burger, Pizza, Traditional Luwombo) or table reservations, just let me know!`;
+      }
     }
   } else if (industry === 'hardware') {
-    if (normInput.includes('cement') || normInput.includes('sheet') || normInput.includes('material') || normInput.includes('paint') || isAffirmation) {
+    if (normInput.includes('cement') || normInput.includes('sheet') || normInput.includes('material') || normInput.includes('paint') || isAffirmation || normInput.includes('construction') || normInput.includes('quote') || normInput.includes('iron') || normInput.includes('hardware')) {
       reply = `🧱 *Construction Hardware Quote*\n\nMaterials billing quote compiled for *${lastMaterial}*:\n- *Standard Fares:* Cement bags (UGX 38,000/bag) or paint drums (UGX 140,000)\n- *Dispatch:* Available flatbed 4-tonne cargo Isuzu truck dispatch.\n\nShould we finalize invoice delivery and assign a cargo transporter?`;
       workflowTriggered = 'Bulk construction materials quote';
       toolCalls.push({ name: 'check_hardware_catalog', args: { material: lastMaterial }, result: { success: true } });
-    } else {
+    } else if (isGreeting) {
       reply = `Welcome to construction supplies terminal. Ask us for cement (UGX 38k), color sheets (UGX 48k), paint, domestic electrical wires, or local flatbed deliveries!${ragSnippet}`;
+    } else {
+      if (ragSnippet) {
+        reply = `Let me assist you with our hardware inventory parameters. ${ragSnippet}`;
+      } else {
+        reply = `Welcome to our construction supplies catalog. Let me know if you would like we to compile a supply quote for cement, iron sheets, or premium paints!`;
+      }
     }
   } else if (industry === 'security') {
-    if (normInput.includes('guard') || normInput.includes('fence') || normInput.includes('patrol') || normInput.includes('bodyguard') || isAffirmation) {
+    if (normInput.includes('guard') || normInput.includes('fence') || normInput.includes('patrol') || normInput.includes('bodyguard') || isAffirmation || normInput.includes('security') || normInput.includes('protect') || normInput.includes('alarm')) {
       reply = `🛡️ *Integrated Safety Guarding & Fence quotes*\n\nSupervised patrol logged for *${lastGuardType}*:\n- *Costing profile:* Domestic sentries start at UGX 280,000, or razor-wire set at UGX 1.8M\n- *Response center:* Active rapid responder dispatched under 8 mins on alarms.\n\nWould you like me to book a specialist assessment tour of your premises?`;
       workflowTriggered = 'Guarding Dispatch';
       toolCalls.push({ name: 'dispatch_guard_routing', args: { service: lastGuardType }, result: { success: true } });
-    } else {
+    } else if (isGreeting) {
       reply = `Greetings from Security Response Dispatch. Ask us about corporate guard splits (UGX 350k), perimeter electric razor fences, bodyguards, and rapid emergency alarms!${ragSnippet}`;
+    } else {
+      if (ragSnippet) {
+        reply = `Let me share our security guarding details. ${ragSnippet}`;
+      } else {
+        reply = `Welcome to our security operations support line. Ask me about guard rates, electric fence setup, or VIP security bodyguard escorts!`;
+      }
     }
   } else {
-    // Basic general business simulation
-    if (normInput.includes('quote') || normInput.includes('price') || normInput.includes('how much') || normInput.includes('buy')) {
-      reply = `Thank you for your inquiry about our operations! I have prepared a business quotation:\n- Standout Core Services: UGX 120,000 standard setup fee\n- Volume client support: UGX 50,000 recurring monthly support\n\nTo seal this deal, we can issue invoice receipts and connect you with a corporate staff member. Do you need additional specs?`;
-      workflowTriggered = 'Standard Pricing Flow';
+    // Dynamic system template simulation support
+    const template = db.getIndustryTemplate(industry);
+    const tenant = db.getTenant(tenantId);
+    const company = tenant ? tenant.company_name : 'Our Business';
+    
+    if (template) {
+      // Find matching template FAQs based on input words
+      const matchedFAQ = template.faqs.find((f) => 
+        normInput.includes(f.question.toLowerCase()) || 
+        f.question.toLowerCase().split(' ').some(w => w.length > 4 && normInput.includes(w))
+      );
+      
+      const matchedService = template.services.find((s) => 
+        normInput.includes(s.toLowerCase())
+      );
+
+      if (matchedFAQ) {
+        reply = `💬 *${company} Support Desk*\n\n*Q:* ${matchedFAQ.question}\n*A:* ${matchedFAQ.answer}\n\nOur ${template.name} division standardizes: ${template.terminology.slice(0, 3).join(', ')}. Let me know if you would like me to book any services!`;
+      } else if (matchedService) {
+        reply = `💼 *Dynamic Service Profile: ${matchedService}*\n\nWe provide professional *${matchedService}* as part of our core catalog and support details:\n- Standard operational policies apply.\n- Our staff has specialized training in *${template.terminology.slice(0, 3).join(', ')}* procedures.\n- Physical Office Address: ${tenant?.physical_address || 'Kampala, Uganda'}\n- Support Email Line: ${tenant?.email_address || 'support@kampala.org'}\n\nWould you like me to reserve a scheduling ticket for you today?`;
+      } else if (normInput.includes('quote') || normInput.includes('price') || normInput.includes('how much') || normInput.includes('buy') || normInput.includes('cost') || normInput.includes('fare')) {
+        reply = `📊 *${company} Pricing & Quotations*\n\nHere are our ${template.name} typical packages:\n${template.services.map(s => `- *${s}*`).join('\n')}\n\nWe can arrange custom configurations. Are you interested in getting a custom proposal draft? Just say "yes please"!`;
+        workflowTriggered = 'Dynamic Template Quote';
+      } else if (isGreeting) {
+        reply = `Hello! Welcome to *${company}* parent info portal. I am *${company} School AI Counselor*. Ask me about our specialized typical services: ${template.services.slice(0, 3).join(', ')}, or standard sector circulars! Ask me anything, designed for ${template.name}.`;
+      } else {
+        if (ragSnippet) {
+          reply = `Here is what I found in our core training datasets: ${ragSnippet}`;
+        } else {
+          reply = `Welcome to *${company}* information workspace. I am fully trained in the *${template.name}* sector, referencing ${template.terminology.slice(0, 4).join(', ')} guidelines. How can I help you today?`;
+        }
+      }
     } else {
-      reply = `Hello! Welcome to our AI assistant. I have cross-referenced our knowledge repositories... We provide full-suite customer operations in the Uganda marketplace. Let me know how we can solve your request today!${ragSnippet}`;
+      // Basic fallback
+      if (normInput.includes('quote') || normInput.includes('price') || normInput.includes('how much') || normInput.includes('buy')) {
+        reply = `Thank you for your inquiry about ${company}! I have prepared a business quotation:\n- Standout Core Services: UGX 120,000 standard setup fee\n- Volume client support: UGX 50,000 recurring monthly support\n\nTo seal this deal, we can issue invoice receipts and connect you with a corporate staff member. Do you need additional specs?`;
+        workflowTriggered = 'Standard Pricing Flow';
+      } else {
+        reply = `Hello! Welcome to *${company}* AI assistant. We provide full-suite customer operations in the Uganda marketplace. Let me know how we can solve your request today!${ragSnippet}`;
+      }
     }
   }
 
@@ -548,20 +724,33 @@ Based on our conversation history, I see you were exploring ${hint || 'our busin
     }
   }
 
+  // Strip RAG references footnote if it got appended to the end of the text,
+  // so the raw message content shown to standard customers is completely clean
+  let cleanedReply = reply;
+  if (reply.includes('📌 *For your reference:*')) {
+    cleanedReply = reply.split('📌 *For your reference:*')[0].trim();
+  }
+
   return {
-    reply,
+    reply: cleanedReply,
     toolCalls,
     workflowTriggered,
-    customerLeadScore: score
+    customerLeadScore: score,
+    ragReferences: ragSnippet
   };
 }
 
 // Full async Gemini AI integration core dispatcher
 async function generateContentWithRetryAndFallback(client: GoogleGenAI, systemPrompt: string, query: string): Promise<string> {
+  if (geminiApiQuotaExceeded) {
+    throw new Error('Gemini quota limit exceeded.');
+  }
+
   const modelsToTry = ['gemini-3.5-flash', 'gemini-3.1-flash-lite', 'gemini-flash-latest'];
   let lastError: any = null;
 
   for (const model of modelsToTry) {
+    if (geminiApiQuotaExceeded) break;
     for (let attempt = 1; attempt <= 2; attempt++) {
       try {
         const response = await client.models.generateContent({
@@ -577,7 +766,13 @@ async function generateContentWithRetryAndFallback(client: GoogleGenAI, systemPr
         }
       } catch (err: any) {
         lastError = err;
-        console.warn(`Model ${model} attempt ${attempt} failed, retrying or trying alternate:`, err?.message || err);
+        const errMsg = String(err?.message || err || '');
+        if (errMsg.includes('prepayment credits') || errMsg.includes('RESOURCE_EXHAUSTED') || errMsg.includes('429') || errMsg.includes('billing')) {
+          geminiApiQuotaExceeded = true;
+          console.log('[System Info] Gemini developer billing limits or credit thresholds reached. Gracefully switching to interactive offline simulator mode.');
+          throw err;
+        }
+        console.log(`[Diagnostic] Model ${model} attempt ${attempt} did not complete:`, errMsg);
         await new Promise((resolve) => setTimeout(resolve, 300));
       }
     }
@@ -628,21 +823,51 @@ export async function runAICoreEngine(
       : `No prior conversation history. This user is starting a brand new conversation with you.`;
 
     const reactivationSnippet = isReactivated 
-      ? `\nCRITICAL CONTEXT: This customer.id is returning and starting a fresh session after having resolved their previous tickets. Warmly welcome them back, acknowledge they were here before, and DO NOT ask them to repeat information (like names, addresses, or previous products) they have already submitted in the conversation history snippet above.`
+      ? `\nCRITICAL CONTEXT: This customer is returning and starting a fresh session after having resolved their previous tickets. Warmly welcome them back, acknowledge they were here before, and DO NOT ask them to repeat information (like names, addresses, or previous products) they have already submitted in the conversation history snippet above.`
       : '';
 
-    const systemPrompt = `You are Swibz AI Core - a production-safe multi-tenant system executing virtual workflows and tool calls for "${tenant.company_name}" (Industry: ${tenant.industry_type}).
-Your replies must strictly represent the business profile.
-Address the customer politely. Keep replies clean, professional, and localized in Ugandan context if helpful (Currency is UGX).
+    const template = db.getIndustryTemplate(tenant.industry_type);
+
+    const customInstructionsSnippet = tenant.custom_ai_instructions
+      ? `CRITICAL EXTRA DIRECTIVES:\n${tenant.custom_ai_instructions}\n(These override standard templates settings if any contradiction arises.)`
+      : '';
+
+    const industryTemplateSnippet = template
+      ? `DETERMINISTIC SECTOR KNOWLEDGE BASE TEMPLATE (${template.name}):
+- Domain Terminology to speak with: ${template.terminology.join(', ')}
+- Suggested Professional Response Tone Guidelines: ${template.ai_instructions}
+- Standard Industry FAQ references:
+${template.faqs.map((f, i) => `  * FAQ #${i + 1}: Q: ${f.question} | A: ${f.answer}`).join('\n')}`
+      : '';
+
+    const systemPrompt = `You are Swibz AI Core - a production-grade, highly professional assistant for "${tenant.company_name}" (Sector: ${tenant.industry_type}).
+Your replies MUST be concise, friendly, and precise.
+
+CRITICAL KNOWLEDGE PRIORITY ORDER:
+1. PRIVATE COMPANY DATA: Always prioritize specific facts loaded from the company knowledge base (RAG texts, products, pricing, physical profiles) over templates.
+   - Company Contact Phone: ${tenant.phone_number || 'N/A'}
+   - Company Support Email: ${tenant.email_address || 'N/A'}
+   - Physical Location: ${tenant.physical_address || 'N/A'}
+2. CUSTOM SYSTEM DIRECTIVES: Respect custom-written instructions provided by the business manager.
+3. SECTOR KNOWLEDGE TEMPLATES: Adapt preloaded industry terminologies, suggested response tone, and FAO references.
+4. AI GENERAL KNOWLEDGE: Fallback to general intelligence ONLY if the customer asks something unrelated to the business operations.
+
+CRITICAL FORMATTING RULES:
+- Keep your messages short, conversational, and direct (usually under 2-3 short sentences). Avoid long bullet lists.
+- Never write bracketed tags in response text (e.g. do not write "[Matched facts]" or file names). Seamlessly integrate information.
+- Localize details in a Ugandan context where helpful (such as using UGX).
+
+${customInstructionsSnippet}
+
+${industryTemplateSnippet}
+
 ${reactivationSnippet}
 
 ${contextSnippet}
 
 ${historySnippet}
 
-Based on the customer request and history, decide the appropriate response.
-You have access to virtual tool call capabilities, but DO NOT write JSON schemas manually in response text. Speak naturally.
-If they are confirming an order, requesting booking, pricing, record lookup, solve it inside your instructions and formulate a perfect natural-language reply showing the solved numbers.`;
+Based on the customer request, history, and the priority data layers above, decide the appropriate response. Speak naturally and politely. Do not write JSON code in response text.`;
 
     const replyText = await generateContentWithRetryAndFallback(client, systemPrompt, query);
 
@@ -654,11 +879,23 @@ If they are confirming an order, requesting booking, pricing, record lookup, sol
       reply: replyText,
       toolCalls: simulatedResult.toolCalls,
       workflowTriggered: simulatedResult.workflowTriggered,
-      customerLeadScore: simulatedResult.customerLeadScore
+      customerLeadScore: simulatedResult.customerLeadScore,
+      ragReferences: simulatedResult.ragReferences
     };
 
-  } catch (error) {
-    console.error('Gemini content generation failed, routing to local simulator:', error);
+  } catch (error: any) {
+    const errorMsg = error?.message || '';
+    if (errorMsg.includes('prepayment credits') || errorMsg.includes('RESOURCE_EXHAUSTED') || errorMsg.includes('429')) {
+      console.warn('\n========================================= DIAGNOSTIC TIP =========================================');
+      console.warn('⚠️ WARNING: Your Google AI Studio/Gemini API billing or prepayment credit limit has been reached.');
+      console.warn('🚀 RESOLUTION: To enable real live-connected AI replies, please update your billing in Google AI Studio');
+      console.warn('   (https://ai.studio/projects) or check your API keys in the Settings -> Secrets panel.');
+      console.warn('🔄 FALLBACK: To maintain a pristine, unbroken experience, we have automatically routed this conversational');
+      console.warn('   workflow to your custom local interactive simulator which generates perfect mock responses.');
+      console.warn('==================================================================================================\n');
+    } else {
+      console.error('Gemini content generation failed, routing to local simulator:', error);
+    }
     return processConversationalSimulation(tenant.industry_type, query, tenantId, customerId);
   }
 }
@@ -709,8 +946,12 @@ ${logTimeline}`;
         }
       });
       learnedText = response.text || '';
-    } catch (e) {
-      console.error('Error generating conversational learnings:', e);
+    } catch (e: any) {
+      const errMsg = String(e?.message || e || '');
+      if (errMsg.includes('prepayment credits') || errMsg.includes('RESOURCE_EXHAUSTED') || errMsg.includes('429') || errMsg.includes('billing')) {
+        geminiApiQuotaExceeded = true;
+      }
+      console.log('[System Info] Conversational learnings offline fallback activated.');
     }
   }
 
@@ -800,8 +1041,12 @@ Include real localized details of local operators, guidelines, regulations, or r
           }
         });
       }
-    } catch (e) {
-      console.warn('Google search grounding failed; running secure text fallback...', e);
+    } catch (e: any) {
+      const errMsg = String(e?.message || e || '');
+      if (errMsg.includes('prepayment credits') || errMsg.includes('RESOURCE_EXHAUSTED') || errMsg.includes('429') || errMsg.includes('billing')) {
+        geminiApiQuotaExceeded = true;
+      }
+      console.log('[System Info] Google search grounding or quota reached; switching to simulator fallback.');
     }
   }
 

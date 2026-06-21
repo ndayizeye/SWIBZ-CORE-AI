@@ -45,7 +45,8 @@ async function processInboundChannelMessage(
     // 5. Log AI Core responses
     const aiMessage = await db.addMessage(conversation.id, 'ai', aiResult.reply, {
       tool_calls: aiResult.toolCalls,
-      workflow_triggered: aiResult.workflowTriggered
+      workflow_triggered: aiResult.workflowTriggered,
+      rag_references: aiResult.ragReferences
     });
 
     // 6. Return response

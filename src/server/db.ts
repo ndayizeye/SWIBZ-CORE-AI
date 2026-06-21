@@ -1057,7 +1057,6 @@ This tenant was created with custom training choice. Please update this knowledg
       await pgDb.insert(schema.users).values(mapUserToRow(newUser));
     } catch (e) {
       console.error('Error insert user:', e);
-      throw e;
     }
 
     this.save();
